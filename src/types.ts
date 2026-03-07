@@ -1,9 +1,19 @@
 export interface Trip {
   id: string;
+  documentId?: string; // Firestore document ID
   name: string;
   start_date: string;
   end_date: string;
   country: string;
+  owner_id: string;
+  shared_with: string[]; // Array of user IDs
+}
+
+export interface User {
+  id: string;
+  username: string;
+  password: string;
+  role: 'admin' | 'user';
 }
 
 export interface Activity {
@@ -17,6 +27,7 @@ export interface Activity {
   note: string;
   is_flight: boolean;
   travel_mode: 'walking' | 'transit' | 'driving';
+  ai_advice?: string;
 }
 
 export interface Accommodation {

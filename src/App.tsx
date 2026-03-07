@@ -20,11 +20,12 @@ import {
   Bus,
   MoreHorizontal,
   Download,
-  Share2
+  Share2,
+  Users
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
 import { cn, CURRENCY_MAP, COUNTRY_LIST } from './utils';
-import { Trip, Activity, Expense, Accommodation, ChecklistItem } from './types';
+import { Trip, Activity, Expense, Accommodation, ChecklistItem, User } from './types';
 import { geminiService } from './services/geminiService';
 import { db } from './services/firebase';
 import { 
@@ -110,28 +111,161 @@ export default function App() {
   const [aiAdvice, setAiAdvice] = useState<Record<string, string>>({});
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
 
+  // Multi-user states
+  const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [allUsers, setAllUsers] = useState<User[]>([]);
+  const [isUserManagementOpen, setIsUserManagementOpen] = useState(false);
+  const [isLoginOpen, setIsLoginOpen] = useState(true);
+  const [loginError, setLoginError] = useState('');
+  const [isManagingBuddies, setIsManagingBuddies] = useState(false);
+  const [tripToManage, setTripToManage] = useState<Trip | null>(null);
+  const [showTotalExpense, setShowTotalExpense] = useState(false);
+  const [showAiActivityInput, setShowAiActivityInput] = useState(false);
+  const [aiActivityText, setAiActivityText] = useState('');
+  const [isAiChatOpen, setIsAiChatOpen] = useState(false);
+  const [aiChatInput, setAiChatInput] = useState('');
+  const [aiChatMessages, setAiChatMessages] = useState<{role: 'user' | 'ai', content: string}[]>([]);
+  const [isAiChatLoading, setIsAiChatLoading] = useState(false);
+
+  useEffect(() => {
+    const savedUser = localStorage.getItem('travel_planner_user');
+    if (savedUser) {
+      setCurrentUser(JSON.parse(savedUser));
+      setIsLoginOpen(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (currentUser?.role === 'admin') {
+      const unsubUsers = onSnapshot(collection(db, "users"), (snapshot) => {
+        const usersData = snapshot.docs.map(doc => ({ ...doc.data(), id: doc.id })) as User[];
+        setAllUsers(usersData);
+      });
+      return () => unsubUsers();
+    }
+  }, [currentUser]);
+
+  const handleLogin = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+    const username = formData.get('username') as string;
+    const password = formData.get('password') as string;
+
+    setLoading(true);
+    setLoginError('');
+
+    try {
+      const q = query(collection(db, "users"), where("username", "==", username), where("password", "==", password));
+      const snapshot = await getDocs(q);
+      
+      if (snapshot.empty) {
+        // For the very first time, if no users exist, let the first login be admin
+        const allUsersSnap = await getDocs(collection(db, "users"));
+        if (allUsersSnap.empty && username === 'admin') {
+          const newUser = {
+            username,
+            password,
+            role: 'admin' as const
+          };
+          const docRef = await addDoc(collection(db, "users"), newUser);
+          const user = { ...newUser, id: docRef.id };
+          setCurrentUser(user);
+          localStorage.setItem('travel_planner_user', JSON.stringify(user));
+          setIsLoginOpen(false);
+        } else {
+          setLoginError('帳號或密碼錯誤');
+        }
+      } else {
+        const user = { ...snapshot.docs[0].data(), id: snapshot.docs[0].id } as User;
+        setCurrentUser(user);
+        localStorage.setItem('travel_planner_user', JSON.stringify(user));
+        setIsLoginOpen(false);
+      }
+    } catch (err) {
+      console.error(err);
+      setLoginError('登入失敗，請稍後再試');
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  const handleLogout = () => {
+    setCurrentUser(null);
+    localStorage.removeItem('travel_planner_user');
+    setIsLoginOpen(true);
+    setSelectedTrip(null);
+  };
+
+  const handleAddUser = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    const formData = new FormData(e.currentTarget);
+    const username = formData.get('username') as string;
+    const password = Math.random().toString(36).slice(-8); // Auto-generate password
+
+    try {
+      await addDoc(collection(db, "users"), {
+        username,
+        password,
+        role: 'user'
+      });
+      alert(`使用者已建立！\n帳號：${username}\n密碼：${password}\n請務必告知使用者此密碼。`);
+      (e.target as HTMLFormElement).reset();
+    } catch (err) {
+      console.error(err);
+      alert('建立失敗');
+    }
+  };
+
+  const handleUpdateBuddies = async (e: React.FormEvent<HTMLFormElement>) => {
+    e.preventDefault();
+    if (!tripToManage) return;
+    const formData = new FormData(e.currentTarget);
+    const sharedWith = formData.getAll('shared_with') as string[];
+    
+    try {
+      await updateDoc(doc(db, "trips", tripToManage.documentId || tripToManage.id), {
+        shared_with: sharedWith
+      });
+      fetchTrips();
+      setIsManagingBuddies(false);
+      setTripToManage(null);
+    } catch (err) {
+      console.error(err);
+      alert('更新失敗');
+    }
+  };
+
+  const handleDeleteUser = async (id: string) => {
+    if (!confirm('確定要刪除此使用者嗎？')) return;
+    try {
+      await deleteDoc(doc(db, "users", id));
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
   // useEffect(() => {
   //   if (activities.length > 0) {
   //     calculateAllTravelTimes();
   //   }
   // }, [activities]);
 
-  useEffect(() => {
-    if (selectedTrip && activities.length > 0) {
-      const fetchMissingAdvice = async () => {
-        const missing = activities.filter(a => !a.is_flight && !aiAdvice[a.activity]);
-        for (const activity of missing) {
-          try {
-            const advice = await geminiService.getItineraryAdvice(activity.activity, selectedTrip.country);
-            setAiAdvice(prev => ({ ...prev, [activity.activity]: advice || '暫無建議' }));
-          } catch (err) {
-            console.error(err);
-          }
-        }
-      };
-      fetchMissingAdvice();
-    }
-  }, [activities, selectedTrip]);
+  // useEffect(() => {
+  //   if (selectedTrip && activities.length > 0) {
+  //     const fetchMissingAdvice = async () => {
+  //       const missing = activities.filter(a => !a.is_flight && !aiAdvice[a.activity]);
+  //       for (const activity of missing) {
+  //         try {
+  //           const advice = await geminiService.getItineraryAdvice(activity.activity, selectedTrip.country);
+  //           setAiAdvice(prev => ({ ...prev, [activity.activity]: advice || '暫無建議' }));
+  //         } catch (err) {
+  //           console.error(err);
+  //         }
+  //       }
+  //     };
+  //     fetchMissingAdvice();
+  //   }
+  // }, [activities, selectedTrip]);
 
   const calculateAllTravelTimes = async () => {
     const times: Record<string, string> = {};
@@ -161,9 +295,11 @@ export default function App() {
 
   };
 
-    useEffect(() => {
-    fetchTrips();
-  }, []);
+  useEffect(() => {
+    if (currentUser) {
+      fetchTrips();
+    }
+  }, [currentUser]);
 
   useEffect(() => {
     if (!selectedTrip) return;
@@ -213,11 +349,44 @@ export default function App() {
     };
   }, [selectedTrip]);
 
-    const fetchTrips = async () => {
+  const fetchTrips = async () => {
+    if (!currentUser) return;
     const tripsCollection = collection(db, "trips");
-    const tripsSnapshot = await getDocs(tripsCollection);
-    const tripsList = tripsSnapshot.docs.map(doc => ({ id: doc.id, ...doc.data() })) as Trip[];
-    setTrips(tripsList);
+    let tripsList: Trip[] = [];
+    
+    try {
+      if (currentUser.role === 'admin') {
+        const tripsSnapshot = await getDocs(tripsCollection);
+        tripsList = tripsSnapshot.docs.map(doc => {
+          const data = doc.data();
+          // Backward compatibility: use data.id if it exists (old UUID), otherwise use doc.id
+          // Store Firestore doc ID in documentId for operations like update/delete
+          return { ...data, id: data.id || doc.id, documentId: doc.id } as Trip;
+        });
+      } else {
+        // For regular users, check both owner_id and shared_with
+        const q = query(tripsCollection, where("shared_with", "array-contains", currentUser.id));
+        const tripsSnapshot = await getDocs(q);
+        const sharedTrips = tripsSnapshot.docs.map(doc => {
+          const data = doc.data();
+          return { ...data, id: data.id || doc.id, documentId: doc.id } as Trip;
+        });
+
+        const q2 = query(tripsCollection, where("owner_id", "==", currentUser.id));
+        const tripsSnapshot2 = await getDocs(q2);
+        const ownedTrips = tripsSnapshot2.docs.map(doc => {
+          const data = doc.data();
+          return { ...data, id: data.id || doc.id, documentId: doc.id } as Trip;
+        });
+
+        // Merge and remove duplicates
+        const combined = [...sharedTrips, ...ownedTrips];
+        tripsList = Array.from(new Map(combined.map(item => [item.id, item])).values());
+      }
+      setTrips(tripsList);
+    } catch (err) {
+      console.error("Error fetching trips:", err);
+    }
   };
 
   
@@ -235,15 +404,19 @@ export default function App() {
 
   const handleCreateTrip = async (e: React.FormEvent<HTMLFormElement>) => {
     e.preventDefault();
+    if (!currentUser) return;
     const formData = new FormData(e.currentTarget);
+    const sharedWith = formData.getAll('shared_with') as string[];
+    
     const newTrip = {
-      id: crypto.randomUUID(),
       name: formData.get('name') as string,
       start_date: formData.get('start_date') as string,
       end_date: formData.get('end_date') as string,
       country: formData.get('country') as string,
+      owner_id: currentUser.id,
+      shared_with: sharedWith,
     };
-        await addDoc(collection(db, "trips"), newTrip);
+    await addDoc(collection(db, "trips"), newTrip);
     fetchTrips();
     setIsAddingTrip(false);
   };
@@ -252,20 +425,60 @@ export default function App() {
     e.preventDefault();
     if (!selectedTrip) return;
     const formData = new FormData(e.currentTarget);
+    let activityName = formData.get('activity') as string;
+    const mapUrl = formData.get('map_url') as string;
+
+    // Auto-fill activity name from Google Maps URL if empty
+    if (!activityName && mapUrl) {
+      try {
+        // Try to extract from standard Google Maps URL patterns
+        // Pattern 1: .../place/PLACE_NAME/...
+        const placeMatch = mapUrl.match(/\/place\/([^/]+)/);
+        if (placeMatch && placeMatch[1]) {
+          activityName = decodeURIComponent(placeMatch[1].replace(/\+/g, ' '));
+        } else {
+          // Pattern 2: query=PLACE_NAME
+          const queryMatch = mapUrl.match(/query=([^&]+)/);
+          if (queryMatch && queryMatch[1]) {
+            activityName = decodeURIComponent(queryMatch[1].replace(/\+/g, ' '));
+          }
+        }
+      } catch (e) {
+        console.error("Failed to parse map URL", e);
+      }
+      
+      // Fallback if parsing failed
+      if (!activityName) {
+        activityName = "新行程";
+      }
+    }
+
     const newActivity = {
       id: crypto.randomUUID(),
       trip_id: selectedTrip.id,
       date: formData.get('date') as string,
       start_time: formData.get('start_time') as string,
       end_time: formData.get('end_time') as string,
-      activity: formData.get('activity') as string,
-      map_url: formData.get('map_url') as string || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(selectedTrip.country + ' ' + formData.get('activity'))}`,
+      activity: activityName,
+      map_url: mapUrl || `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(selectedTrip.country + ' ' + activityName)}`,
       note: formData.get('note') as string,
       is_flight: formData.get('is_flight') === 'on',
       travel_mode: formData.get('travel_mode') as string || 'transit',
     };
-        await addDoc(collection(db, "activities"), newActivity);
+    
+    const docRef = await addDoc(collection(db, "activities"), newActivity);
     setIsAddingActivity(false);
+
+    // Fetch AI advice asynchronously and update the document
+    if (!newActivity.is_flight) {
+      geminiService.getItineraryAdvice(activityName, selectedTrip.country)
+        .then(advice => {
+          if (advice) {
+            updateDoc(docRef, { ai_advice: advice });
+          }
+        })
+        .catch(err => console.error("Failed to fetch AI advice", err));
+    }
   };
 
   const handleAddFlight = async (e: React.FormEvent<HTMLFormElement>) => {
@@ -376,6 +589,81 @@ export default function App() {
     reader.readAsDataURL(file);
   };
 
+  const handleAiChatSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!aiChatInput.trim() || !selectedTrip) return;
+
+    const userMessage = aiChatInput;
+    setAiChatMessages(prev => [...prev, { role: 'user', content: userMessage }]);
+    setAiChatInput('');
+    setIsAiChatLoading(true);
+
+    try {
+      const response = await geminiService.getItinerarySuggestion(selectedTrip, activities, userMessage);
+      setAiChatMessages(prev => [...prev, { role: 'ai', content: response || "抱歉，我現在無法回答，請稍後再試。" }]);
+    } catch (err) {
+      console.error(err);
+      setAiChatMessages(prev => [...prev, { role: 'ai', content: "發生錯誤，請檢查網路連線。" }]);
+    } finally {
+      setIsAiChatLoading(false);
+    }
+  };
+
+  const handleScanActivity = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    setLoading(true);
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const base64 = (reader.result as string).split(',')[1];
+      try {
+        const res = await geminiService.parseActivityInfo('', base64, file.type);
+        // Pre-fill the form but don't submit yet
+        const form = document.querySelector('form[name="activityForm"]') as HTMLFormElement;
+        if (form) {
+          if (res.activity) (form.elements.namedItem('activity') as HTMLInputElement).value = res.activity;
+          if (res.date) (form.elements.namedItem('date') as HTMLSelectElement).value = res.date;
+          if (res.start_time) (form.elements.namedItem('start_time') as HTMLInputElement).value = res.start_time;
+          if (res.end_time) (form.elements.namedItem('end_time') as HTMLInputElement).value = res.end_time;
+          if (res.note) (form.elements.namedItem('note') as HTMLTextAreaElement).value = res.note;
+          if (res.map_url) (form.elements.namedItem('map_url') as HTMLInputElement).value = res.map_url;
+        }
+        setShowAiActivityInput(false);
+      } catch (err) {
+        console.error(err);
+        alert('解析失敗，請稍後再試');
+      } finally {
+        setLoading(false);
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleAiActivityTextSubmit = async () => {
+    if (!aiActivityText.trim()) return;
+    setLoading(true);
+    try {
+      const res = await geminiService.parseActivityInfo(aiActivityText);
+      const form = document.querySelector('form[name="activityForm"]') as HTMLFormElement;
+      if (form) {
+        if (res.activity) (form.elements.namedItem('activity') as HTMLInputElement).value = res.activity;
+        if (res.date) (form.elements.namedItem('date') as HTMLSelectElement).value = res.date;
+        if (res.start_time) (form.elements.namedItem('start_time') as HTMLInputElement).value = res.start_time;
+        if (res.end_time) (form.elements.namedItem('end_time') as HTMLInputElement).value = res.end_time;
+        if (res.note) (form.elements.namedItem('note') as HTMLTextAreaElement).value = res.note;
+        if (res.map_url) (form.elements.namedItem('map_url') as HTMLInputElement).value = res.map_url;
+      }
+      setShowAiActivityInput(false);
+      setAiActivityText('');
+    } catch (err) {
+      console.error(err);
+      alert('解析失敗，請稍後再試');
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const handleScanFlight = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
@@ -405,10 +693,25 @@ export default function App() {
   const generatePdfBlob = async (): Promise<Blob | null> => {
     if (!selectedTrip) return null;
     
+    setLoading(true);
     try {
+      // Translate data to English for PDF
+      const dataToTranslate = {
+        trip: selectedTrip,
+        activities: activities,
+        accommodations: accommodations
+      };
+      
+      const translated = await geminiService.translateItinerary(dataToTranslate);
+      const tTrip = translated.trip || selectedTrip;
+      const tActivities = ((translated.activities || activities) as Activity[]).sort((a, b) => a.start_time.localeCompare(b.start_time));
+      const tAccommodations = (translated.accommodations || accommodations) as Accommodation[];
+
       const doc = new jsPDF();
 
-      // Add the font to the virtual file system
+      // For English PDF, we can use standard fonts or keep Noto for safety, 
+      // but we'll use standard Helvetica/Times for a "pure English" feel if possible.
+      // However, keeping the font setup ensures special characters are handled.
       if (notoSansTCRegular) {
         doc.addFileToVFS('NotoSansTC-Regular.ttf', notoSansTCRegular);
         doc.addFont('NotoSansTC-Regular.ttf', 'NotoSansTC', 'normal');
@@ -426,12 +729,12 @@ export default function App() {
       doc.setFont('NotoSerifTC', 'bold');
       doc.setFontSize(24);
       doc.setTextColor('#18181b');
-      doc.text(selectedTrip.name, 15, 20);
+      doc.text(tTrip.name, 15, 20);
       
       doc.setFont('NotoSansTC', 'normal');
       doc.setFontSize(10);
       doc.setTextColor('#71717a');
-      doc.text(`${selectedTrip.country} | ${selectedTrip.start_date} ~ ${selectedTrip.end_date}`, 15, 28);
+      doc.text(`${tTrip.country} | ${tTrip.start_date} ~ ${tTrip.end_date}`, 15, 28);
       
       doc.setDrawColor('#e4e4e7');
       doc.line(15, 35, pageWidth - 15, 35);
@@ -439,18 +742,18 @@ export default function App() {
       let currentY = 45;
 
       // Flights
-      const flights = activities.filter(a => a.is_flight);
+      const flights = tActivities.filter(a => a.is_flight);
       if (flights.length > 0) {
         doc.setFont('NotoSerifTC', 'bold');
         doc.setFontSize(12);
         doc.setTextColor('#a1a1aa');
-        doc.text("航班資訊", 15, currentY);
+        doc.text("Flight Information", 15, currentY);
         doc.setFont('NotoSansTC', 'normal');
         currentY += 8;
 
         autoTable(doc, {
           startY: currentY,
-          head: [['航班/活動', '日期', '時間']],
+          head: [['Flight/Activity', 'Date', 'Time']],
           body: flights.map(f => [f.activity, f.date, `${f.start_time} - ${f.end_time}`]),
           theme: 'striped',
           styles: { font: 'NotoSansTC', fontStyle: 'normal' },
@@ -461,18 +764,18 @@ export default function App() {
       }
 
       // Accommodations
-      if (accommodations.length > 0) {
+      if (tAccommodations.length > 0) {
         doc.setFont('NotoSerifTC', 'bold');
         doc.setFontSize(12);
         doc.setTextColor('#a1a1aa');
-        doc.text("住宿安排", 15, currentY);
+        doc.text("Accommodations", 15, currentY);
         doc.setFont('NotoSansTC', 'normal');
         currentY += 8;
 
         autoTable(doc, {
           startY: currentY,
-          head: [['飯店名稱', '地址', '日期']],
-          body: accommodations.map(acc => [acc.name, acc.address, `${acc.check_in} ~ ${acc.check_out}`]),
+          head: [['Hotel Name', 'Address', 'Dates']],
+          body: tAccommodations.map(acc => [acc.name, acc.address, `${acc.check_in} ~ ${acc.check_out}`]),
           theme: 'grid',
           styles: { font: 'NotoSansTC', fontStyle: 'normal' },
           headStyles: { fillColor: [113, 113, 122], textColor: [255, 255, 255] },
@@ -485,13 +788,13 @@ export default function App() {
       doc.setFont('NotoSerifTC', 'bold');
       doc.setFontSize(12);
       doc.setTextColor('#a1a1aa');
-      doc.text("每日行程", 15, currentY);
+      doc.text("Daily Itinerary", 15, currentY);
       doc.setFont('NotoSansTC', 'normal');
       currentY += 10;
 
       const dates = getDateRange();
       dates.forEach((date, i) => {
-        const dayActs = activities.filter(a => a.date === date && !a.is_flight);
+        const dayActs = tActivities.filter(a => a.date === date && !a.is_flight);
         
         if (currentY > 250) {
           doc.addPage();
@@ -505,13 +808,12 @@ export default function App() {
         doc.text(`Day ${i + 1} (${format(parseISO(date), 'M/d')})`, 18, currentY);
         
         doc.setTextColor('#71717a');
-        // doc.text(date, 45, currentY);
         currentY += 10;
 
         if (dayActs.length === 0) {
           doc.setFontSize(9);
           doc.setTextColor('#a1a1aa');
-          doc.text("今日無行程", 25, currentY);
+          doc.text("No activities scheduled", 25, currentY);
           currentY += 10;
         } else {
           dayActs.forEach(a => {
@@ -557,6 +859,8 @@ export default function App() {
     } catch (err) {
       console.error('PDF generation failed:', err);
       return null;
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -627,26 +931,51 @@ export default function App() {
     }
   };
 
-  const handleUpdateActivity = async (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!editingActivity) return;
+  const handleDeleteAccommodation = async (id: string) => {
+    if (!confirm('確定要刪除此住宿資訊嗎？')) return;
     try {
-            const activityDoc = doc(db, "activities", editingActivity.id);
-      const { id, ...activityData } = editingActivity; // Firestore update doesn't need the id in the body
-      await updateDoc(activityDoc, activityData);
-      setEditingActivity(null);
+      await deleteDoc(doc(db, "accommodations", id));
     } catch (err) {
       console.error(err);
     }
   };
 
-  const handleDeleteTrip = async (e: React.MouseEvent, id: string) => {
+  const handleUpdateActivity = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!editingActivity || !selectedTrip) return;
+    try {
+      const activityDoc = doc(db, "activities", editingActivity.id);
+      
+      // Check if activity name changed
+      const originalActivity = activities.find(a => a.id === editingActivity.id);
+      const nameChanged = originalActivity && originalActivity.activity !== editingActivity.activity;
+
+      const { id, ...activityData } = editingActivity; // Firestore update doesn't need the id in the body
+      await updateDoc(activityDoc, activityData);
+      setEditingActivity(null);
+
+      // Regenerate AI advice if name changed and it's not a flight
+      if (nameChanged && !editingActivity.is_flight) {
+        geminiService.getItineraryAdvice(editingActivity.activity, selectedTrip.country)
+          .then(advice => {
+            if (advice) {
+              updateDoc(activityDoc, { ai_advice: advice });
+            }
+          })
+          .catch(err => console.error("Failed to update AI advice", err));
+      }
+    } catch (err) {
+      console.error(err);
+    }
+  };
+
+  const handleDeleteTrip = async (e: React.MouseEvent, trip: Trip) => {
     e.stopPropagation();
     if (!confirm('確定要刪除整趟旅程嗎？此動作無法復原。')) return;
     try {
-            await deleteDoc(doc(db, "trips", id));
+      await deleteDoc(doc(db, "trips", trip.documentId || trip.id));
       fetchTrips();
-      if (selectedTrip?.id === id) {
+      if (selectedTrip?.id === trip.id) {
         setSelectedTrip(null);
       }
     } catch (err) {
@@ -746,13 +1075,34 @@ export default function App() {
   function renderTripList() { return (
     <div className="p-4 space-y-6 max-w-2xl mx-auto">
       <div className="flex justify-between items-center py-4">
-        <h1 className="text-2xl font-bold tracking-tight text-zinc-900">我的旅程</h1>
-        <button 
-          onClick={() => setIsAddingTrip(true)}
-          className="p-2 bg-zinc-900 text-white rounded-xl shadow-sm hover:bg-zinc-800 transition-colors"
-        >
-          <Plus size={24} />
-        </button>
+        <div>
+          <h1 className="text-2xl font-bold tracking-tight text-zinc-900">我的旅程</h1>
+          <p className="text-sm text-zinc-400 mt-1">歡迎回來, {currentUser?.username}</p>
+        </div>
+        <div className="flex gap-2">
+          {currentUser?.role === 'admin' && (
+            <button 
+              onClick={() => setIsUserManagementOpen(true)}
+              className="flex items-center gap-2 px-3 py-2 bg-white border border-zinc-200 text-zinc-600 rounded-xl shadow-sm hover:bg-zinc-50 transition-colors text-sm font-bold"
+              title="使用者管理"
+            >
+              <Users size={18} /> 成員管理
+            </button>
+          )}
+          <button 
+            onClick={() => setIsAddingTrip(true)}
+            className="flex items-center gap-2 px-3 py-2 bg-zinc-900 text-white rounded-xl shadow-sm hover:bg-zinc-800 transition-colors text-sm font-bold"
+          >
+            <Plus size={18} /> 新增旅程
+          </button>
+          <button 
+            onClick={handleLogout}
+            className="p-2 bg-white border border-zinc-200 text-zinc-400 rounded-xl shadow-sm hover:text-red-500 transition-colors"
+            title="登出"
+          >
+            <X size={20} />
+          </button>
+        </div>
       </div>
       
       <div className="grid gap-4">
@@ -766,19 +1116,42 @@ export default function App() {
             <div>
               <div className="flex items-center gap-3">
                 <h3 className="text-lg font-bold text-zinc-900">{trip.name}</h3>
-                <button 
-                  onClick={(e) => handleDeleteTrip(e, trip.id)}
-                  className="p-1.5 text-zinc-200 hover:text-red-500 transition-colors"
-                >
-                  <Trash2 size={14} />
-                </button>
+                {currentUser?.role === 'admin' && (
+                  <div className="flex items-center gap-1">
+                    <button 
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setTripToManage(trip);
+                        setIsManagingBuddies(true);
+                      }}
+                      className="p-1.5 text-zinc-300 hover:text-blue-500 transition-colors"
+                      title="管理旅伴"
+                    >
+                      <Users size={14} />
+                    </button>
+                    <button 
+                      onClick={(e) => handleDeleteTrip(e, trip)}
+                      className="p-1.5 text-zinc-300 hover:text-red-500 transition-colors"
+                      title="刪除旅程"
+                    >
+                      <Trash2 size={14} />
+                    </button>
+                  </div>
+                )}
               </div>
               <p className="text-sm text-zinc-500 mt-1 flex items-center gap-1">
                 <Calendar size={14} className="text-zinc-400" /> {trip.start_date} ~ {trip.end_date}
               </p>
-              <span className="inline-block mt-2 px-2 py-0.5 bg-zinc-100 text-zinc-600 text-[10px] font-bold rounded uppercase tracking-wider">
-                {trip.country}
-              </span>
+              <div className="flex gap-2 mt-2">
+                <span className="px-2 py-0.5 bg-zinc-100 text-zinc-600 text-[10px] font-bold rounded uppercase tracking-wider">
+                  {trip.country}
+                </span>
+                {trip.owner_id !== currentUser?.id && (
+                  <span className="px-2 py-0.5 bg-blue-50 text-blue-600 text-[10px] font-bold rounded uppercase tracking-wider">
+                    受邀行程
+                  </span>
+                )}
+              </div>
             </div>
             <ChevronRight className="text-zinc-300" size={20} />
           </motion.div>
@@ -835,11 +1208,19 @@ export default function App() {
                 {isGeneratingPdf ? <Loader2 size={20} className="animate-spin" /> : <Download size={20} />}
               </button>
               <button 
-                onClick={() => setIsExpenseAnalysisOpen(true)}
-                className="bg-zinc-900 text-white px-4 py-2 rounded-xl shadow-sm active:scale-95 transition-all text-right"
+                onClick={() => {
+                  if (showTotalExpense) {
+                    setIsExpenseAnalysisOpen(true);
+                  } else {
+                    setShowTotalExpense(true);
+                  }
+                }}
+                className="bg-zinc-900 text-white px-4 py-2 rounded-xl shadow-sm active:scale-95 transition-all text-right min-w-[100px]"
               >
                 <div className="text-[10px] uppercase font-bold opacity-60">總支出 (TWD)</div>
-                <div className="text-md font-bold">${Math.round(totalExpenseTWD).toLocaleString()}</div>
+                <div className="text-md font-bold">
+                  {showTotalExpense ? `$${Math.round(totalExpenseTWD).toLocaleString()}` : '點擊查看'}
+                </div>
               </button>
             </div>
           </div>
@@ -864,7 +1245,7 @@ export default function App() {
         </div>
 
         {/* Content */}
-        <div className="flex-1 overflow-y-auto p-4 space-y-6 pb-32 max-w-2xl mx-auto w-full">
+        <div className="flex-1 overflow-y-auto p-4 space-y-4 pb-32 max-w-2xl mx-auto w-full">
           {/* Core Info Section */}
           <div className="space-y-3">
             <div className="flex justify-between items-center">
@@ -894,7 +1275,7 @@ export default function App() {
                   className="grid gap-3 overflow-hidden"
                 >
                   {activities.filter(a => a.is_flight).map(flight => (
-                    <div key={flight.id} onClick={() => setEditingActivity(flight)} className="bg-white p-3 rounded-xl border border-zinc-200 shadow-sm flex items-center gap-3 cursor-pointer hover:border-zinc-300 transition-colors">
+                    <div key={flight.id} onClick={() => setEditingActivity(flight)} className="bg-white p-3 rounded-xl border border-zinc-200 shadow-sm flex items-center gap-3 cursor-pointer hover:border-zinc-300 transition-colors group">
                       <div className="w-10 h-10 bg-blue-50 text-blue-500 rounded-lg flex items-center justify-center">
                         <Plane size={20} />
                       </div>
@@ -905,10 +1286,16 @@ export default function App() {
                           <span className="text-[10px] font-bold text-zinc-900">{flight.start_time} - {flight.end_time}</span>
                         </div>
                       </div>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); handleDeleteActivity(flight.id); }}
+                        className="p-2 text-zinc-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"
+                      >
+                        <X size={16} />
+                      </button>
                     </div>
                   ))}
                   {accommodations.map(acc => (
-                    <div key={acc.id} className="bg-white p-3 rounded-xl border border-zinc-200 shadow-sm flex items-center gap-3">
+                    <div key={acc.id} className="bg-white p-3 rounded-xl border border-zinc-200 shadow-sm flex items-center gap-3 group">
                       <div className="w-10 h-10 bg-zinc-50 text-zinc-500 rounded-lg flex items-center justify-center">
                         <Hotel size={20} />
                       </div>
@@ -916,6 +1303,12 @@ export default function App() {
                         <div className="text-sm font-bold text-zinc-900">{acc.name}</div>
                         <div className="text-[10px] font-medium text-zinc-400 mt-0.5">{acc.check_in} ~ {acc.check_out}</div>
                       </div>
+                      <button 
+                        onClick={(e) => { e.stopPropagation(); handleDeleteAccommodation(acc.id); }}
+                        className="p-2 text-zinc-300 hover:text-red-500 transition-colors opacity-0 group-hover:opacity-100"
+                      >
+                        <X size={16} />
+                      </button>
                     </div>
                   ))}
                 </motion.div>
@@ -949,7 +1342,7 @@ export default function App() {
           </div>
 
           {/* Itinerary Section */}
-          <div className="space-y-4">
+          <div className="space-y-2">
             <h3 className="text-sm font-bold text-zinc-400 uppercase tracking-widest">今日行程</h3>
             
             {/* Automatic Hotel Start */}
@@ -1023,21 +1416,24 @@ export default function App() {
                       )}
                     </div>
 
-                    {aiAdvice[activity.activity] && (
+                    {activity.ai_advice && (
                       <motion.div 
                         initial={{ opacity: 0, height: 0 }}
                         animate={{ opacity: 1, height: 'auto' }}
                         className="mt-3 p-3 bg-zinc-50 rounded-xl text-[11px] text-zinc-600 border border-zinc-100 italic"
                       >
-                        {aiAdvice[activity.activity]}
+                        <div className="flex items-center gap-1 mb-1 text-purple-600 font-bold not-italic">
+                          <Sparkles size={10} /> AI 建議
+                        </div>
+                        {activity.ai_advice}
                       </motion.div>
                     )}
                   </motion.div>
 
                   {/* Travel Time Indicator Removed */}
                   {idx < currentActivities.length - 1 && (
-                    <div className="py-4 flex flex-col items-center">
-                      <div className="w-px h-12 bg-zinc-200" />
+                    <div className="py-2 flex flex-col items-center">
+                      <div className="w-px h-6 bg-zinc-200" />
                     </div>
                   )}
                 </div>
@@ -1047,18 +1443,18 @@ export default function App() {
         </div>
 
         {/* Floating Action Buttons */}
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex gap-3 bg-white p-2 rounded-2xl shadow-xl border border-zinc-200">
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 flex gap-2 bg-white p-1.5 rounded-2xl shadow-xl border border-zinc-200 z-20">
           <button 
             onClick={() => setIsAddingActivity(true)}
-            className="flex items-center gap-2 px-6 py-3 bg-zinc-900 text-white rounded-xl font-bold shadow-sm active:scale-95 transition-all"
+            className="flex items-center gap-1.5 px-4 py-2.5 bg-zinc-900 text-white rounded-xl font-bold shadow-sm active:scale-95 transition-all whitespace-nowrap text-sm"
           >
-            <Plus size={20} /> 行程
+            <Plus size={18} /> 新增行程
           </button>
           <button 
             onClick={() => setIsAddingExpense(true)}
-            className="flex items-center gap-2 px-6 py-3 bg-white text-zinc-900 border border-zinc-200 rounded-xl font-bold shadow-sm active:scale-95 transition-all"
+            className="flex items-center gap-1.5 px-4 py-2.5 bg-white text-zinc-900 border border-zinc-200 rounded-xl font-bold shadow-sm active:scale-95 transition-all whitespace-nowrap text-sm"
           >
-            <Wallet size={20} /> 記帳
+            <Wallet size={18} /> 新增記帳
           </button>
         </div>
       </div>
@@ -1114,17 +1510,283 @@ export default function App() {
                   {COUNTRY_LIST.map(c => <option key={c} value={c}>{c}</option>)}
                 </select>
               </div>
+              {currentUser?.role === 'admin' && allUsers.length > 0 && (
+                <div>
+                  <label className="block text-sm font-medium text-zinc-700 mb-1">指派旅伴 (可多選)</label>
+                  <div className="max-h-32 overflow-y-auto p-3 bg-zinc-50 border border-zinc-200 rounded-xl space-y-2">
+                    {allUsers.filter(u => u.id !== currentUser.id).map(user => (
+                      <label key={user.id} className="flex items-center gap-2 text-sm">
+                        <input type="checkbox" name="shared_with" value={user.id} className="rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900" />
+                        {user.username}
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
               <button type="submit" className="w-full py-4 bg-zinc-900 text-white rounded-xl font-bold shadow-lg">確認建立</button>
             </form>
           </Modal>
         )}
 
+        {isLoginOpen && (
+          <div className="fixed inset-0 bg-zinc-50 z-[100] flex items-center justify-center p-4">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.95 }}
+              animate={{ opacity: 1, scale: 1 }}
+              className="bg-white p-8 rounded-3xl shadow-xl border border-zinc-200 w-full max-w-md"
+            >
+              <div className="text-center mb-8">
+                <div className="w-16 h-16 bg-zinc-900 text-white rounded-2xl flex items-center justify-center mx-auto mb-4">
+                  <Sparkles size={32} />
+                </div>
+                <h2 className="text-2xl font-bold text-zinc-900">旅程規劃助手</h2>
+                <p className="text-sm text-zinc-400 mt-2">請登入以開始規劃您的旅程</p>
+              </div>
+
+              <form onSubmit={handleLogin} className="space-y-4">
+                <div>
+                  <label className="block text-sm font-bold text-zinc-600 mb-1">帳號</label>
+                  <input 
+                    name="username" 
+                    required 
+                    className="w-full p-3 bg-zinc-50 border border-zinc-200 rounded-xl focus:border-zinc-400 outline-none" 
+                    placeholder="請輸入帳號"
+                  />
+                </div>
+                <div>
+                  <label className="block text-sm font-bold text-zinc-600 mb-1">密碼</label>
+                  <input 
+                    name="password" 
+                    type="password"
+                    required 
+                    className="w-full p-3 bg-zinc-50 border border-zinc-200 rounded-xl focus:border-zinc-400 outline-none" 
+                    placeholder="請輸入密碼"
+                  />
+                </div>
+                {loginError && <p className="text-xs text-red-500 font-bold">{loginError}</p>}
+                <button type="submit" className="w-full py-4 bg-zinc-900 text-white rounded-xl font-bold shadow-lg active:scale-[0.98] transition-all">
+                  登入
+                </button>
+              </form>
+              <p className="text-[10px] text-zinc-400 text-center mt-6">
+                提示：若是首次登入，請輸入 admin 作為帳號以建立管理員權限。
+              </p>
+            </motion.div>
+          </div>
+        )}
+
+        {/* AI Chat Button */}
+        {selectedTrip && (
+          <>
+            <button
+              onClick={() => setIsAiChatOpen(true)}
+              className="fixed bottom-6 right-6 w-14 h-14 bg-zinc-900 text-white rounded-full shadow-xl flex items-center justify-center hover:scale-105 active:scale-95 transition-all z-50"
+              title="AI 行程顧問"
+            >
+              <Sparkles size={24} />
+            </button>
+
+            <AnimatePresence>
+              {isAiChatOpen && (
+                <motion.div
+                  initial={{ opacity: 0, y: 20, scale: 0.95 }}
+                  animate={{ opacity: 1, y: 0, scale: 1 }}
+                  exit={{ opacity: 0, y: 20, scale: 0.95 }}
+                  className="fixed bottom-24 right-6 w-80 md:w-96 bg-white rounded-2xl shadow-2xl border border-zinc-200 z-50 flex flex-col overflow-hidden max-h-[600px]"
+                >
+                  <div className="p-4 bg-zinc-900 text-white flex items-center justify-between">
+                    <div className="flex items-center gap-2">
+                      <Sparkles size={18} />
+                      <h3 className="font-bold">AI 行程顧問</h3>
+                    </div>
+                    <button onClick={() => setIsAiChatOpen(false)} className="p-1 hover:bg-zinc-800 rounded-lg transition-colors">
+                      <X size={18} />
+                    </button>
+                  </div>
+                  
+                  <div className="flex-1 overflow-y-auto p-4 space-y-4 min-h-[300px] max-h-[400px] bg-zinc-50">
+                    {aiChatMessages.length === 0 && (
+                      <div className="text-center text-zinc-400 text-sm py-8">
+                        <p>👋 你好！我是你的 AI 行程顧問。</p>
+                        <p className="mt-2">不知道某個景點該排在哪一天嗎？</p>
+                        <p>問我就對了！我會根據你的現有行程給出建議。</p>
+                      </div>
+                    )}
+                    {aiChatMessages.map((msg, idx) => (
+                      <div key={idx} className={cn("flex", msg.role === 'user' ? "justify-end" : "justify-start")}>
+                        <div className={cn(
+                          "max-w-[85%] p-3 rounded-2xl text-sm whitespace-pre-wrap",
+                          msg.role === 'user' 
+                            ? "bg-zinc-900 text-white rounded-tr-none" 
+                            : "bg-white border border-zinc-200 text-zinc-800 rounded-tl-none shadow-sm"
+                        )}>
+                          {msg.content}
+                        </div>
+                      </div>
+                    ))}
+                    {isAiChatLoading && (
+                      <div className="flex justify-start">
+                        <div className="bg-white border border-zinc-200 p-3 rounded-2xl rounded-tl-none shadow-sm">
+                          <Loader2 size={16} className="animate-spin text-zinc-400" />
+                        </div>
+                      </div>
+                    )}
+                  </div>
+
+                  <form onSubmit={handleAiChatSubmit} className="p-3 bg-white border-t border-zinc-100 flex gap-2">
+                    <input
+                      value={aiChatInput}
+                      onChange={(e) => setAiChatInput(e.target.value)}
+                      placeholder="例如：我想去晴空塔，排在哪天比較順？"
+                      className="flex-1 bg-zinc-50 border border-zinc-200 rounded-xl px-3 py-2 text-sm outline-none focus:border-zinc-400"
+                    />
+                    <button 
+                      type="submit" 
+                      disabled={!aiChatInput.trim() || isAiChatLoading}
+                      className="p-2 bg-zinc-900 text-white rounded-xl disabled:opacity-50 hover:bg-zinc-800 transition-colors"
+                    >
+                      <Navigation size={18} className="rotate-90" />
+                    </button>
+                  </form>
+                </motion.div>
+              )}
+            </AnimatePresence>
+          </>
+        )}
+
+        {isUserManagementOpen && (
+          <Modal title="使用者管理" onClose={() => setIsUserManagementOpen(false)}>
+            <div className="space-y-6">
+              <form onSubmit={handleAddUser} className="space-y-3">
+                <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-widest">新增使用者</h4>
+                <div className="flex gap-2">
+                  <input 
+                    name="username" 
+                    required 
+                    className="flex-1 p-3 bg-zinc-50 border border-zinc-200 rounded-xl focus:border-zinc-400 outline-none text-sm" 
+                    placeholder="使用者名稱"
+                  />
+                  <button type="submit" className="px-6 bg-zinc-900 text-white rounded-xl font-bold text-sm">新增</button>
+                </div>
+              </form>
+
+              <div className="space-y-3">
+                <h4 className="text-xs font-bold text-zinc-400 uppercase tracking-widest">現有使用者</h4>
+                <div className="space-y-2 max-h-60 overflow-y-auto">
+                  {allUsers.map(user => (
+                    <div key={user.id} className="flex items-center justify-between p-3 bg-zinc-50 border border-zinc-100 rounded-xl">
+                      <div>
+                        <div className="text-sm font-bold text-zinc-800">{user.username}</div>
+                        <div className="text-[10px] text-zinc-400">密碼：{user.password} · 權限：{user.role}</div>
+                      </div>
+                      {user.role !== 'admin' && (
+                        <button onClick={() => handleDeleteUser(user.id)} className="p-2 text-zinc-300 hover:text-red-500 transition-colors">
+                          <Trash2 size={16} />
+                        </button>
+                      )}
+                    </div>
+                  ))}
+                </div>
+              </div>
+            </div>
+          </Modal>
+        )}
+
+        {isManagingBuddies && tripToManage && (
+          <Modal title={`管理旅伴: ${tripToManage.name}`} onClose={() => {
+            setIsManagingBuddies(false);
+            setTripToManage(null);
+          }}>
+            <form onSubmit={handleUpdateBuddies} className="space-y-6">
+              <div>
+                <label className="block text-sm font-medium text-zinc-700 mb-3">選擇要加入此旅程的成員</label>
+                <div className="max-h-60 overflow-y-auto p-4 bg-zinc-50 border border-zinc-200 rounded-2xl space-y-3">
+                  {allUsers.filter(u => u.id !== currentUser?.id).map(user => (
+                    <label key={user.id} className="flex items-center justify-between p-2 hover:bg-white rounded-lg transition-colors cursor-pointer">
+                      <div className="flex items-center gap-3">
+                        <div className="w-8 h-8 bg-zinc-200 rounded-full flex items-center justify-center text-xs font-bold text-zinc-500">
+                          {user.username.charAt(0).toUpperCase()}
+                        </div>
+                        <span className="text-sm font-medium text-zinc-700">{user.username}</span>
+                      </div>
+                      <input 
+                        type="checkbox" 
+                        name="shared_with" 
+                        value={user.id} 
+                        defaultChecked={tripToManage.shared_with?.includes(user.id)}
+                        className="w-5 h-5 rounded border-zinc-300 text-zinc-900 focus:ring-zinc-900" 
+                      />
+                    </label>
+                  ))}
+                  {allUsers.length <= 1 && (
+                    <p className="text-center py-4 text-xs text-zinc-400">尚無其他使用者可供指派</p>
+                  )}
+                </div>
+              </div>
+              <div className="flex gap-3">
+                <button 
+                  type="button"
+                  onClick={() => setIsManagingBuddies(false)}
+                  className="flex-1 py-3 bg-zinc-100 text-zinc-600 rounded-xl font-bold"
+                >
+                  取消
+                </button>
+                <button 
+                  type="submit" 
+                  className="flex-[2] py-3 bg-zinc-900 text-white rounded-xl font-bold shadow-lg"
+                >
+                  儲存變更
+                </button>
+              </div>
+            </form>
+          </Modal>
+        )}
+
         {isAddingActivity && (
-          <Modal title="新增行程" onClose={() => setIsAddingActivity(false)}>
-            <form onSubmit={handleAddActivity} className="space-y-4">
+          <Modal title="新增行程" onClose={() => {
+            setIsAddingActivity(false);
+            setShowAiActivityInput(false);
+            setAiActivityText('');
+          }}>
+            <div className="mb-6">
+              <div className="flex gap-2 mb-4">
+                <button 
+                  onClick={() => setShowAiActivityInput(!showAiActivityInput)}
+                  className="flex-1 flex items-center justify-center gap-2 py-3 bg-zinc-50 text-zinc-600 rounded-xl font-bold border border-zinc-200 hover:bg-zinc-100 transition-colors"
+                >
+                  <Sparkles size={18} className="text-purple-500" /> AI 智慧匯入 (文字)
+                </button>
+                <label className="flex-1 flex items-center justify-center gap-2 py-3 bg-zinc-50 text-zinc-600 rounded-xl font-bold border border-zinc-200 cursor-pointer hover:bg-zinc-100 transition-colors">
+                  <Camera size={18} className="text-blue-500" /> 拍照匯入
+                  <input type="file" className="hidden" accept="image/*" onChange={handleScanActivity} />
+                </label>
+              </div>
+
+              {showAiActivityInput && (
+                <motion.div initial={{ opacity: 0, y: -10 }} animate={{ opacity: 1, y: 0 }} className="space-y-3 p-4 bg-zinc-50 rounded-xl border border-zinc-200 mb-4">
+                  <textarea 
+                    autoFocus
+                    className="w-full p-3 rounded-lg border border-zinc-200 focus:border-zinc-400 outline-none text-sm min-h-[100px]"
+                    placeholder="請貼上訂位確認信、行程文字或任何旅遊資訊..."
+                    value={aiActivityText}
+                    onChange={(e) => setAiActivityText(e.target.value)}
+                  />
+                  <button 
+                    onClick={handleAiActivityTextSubmit}
+                    disabled={loading || !aiActivityText.trim()}
+                    className="w-full py-2 bg-zinc-900 text-white rounded-lg font-bold text-sm disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    {loading ? <Loader2 size={16} className="animate-spin" /> : <Sparkles size={16} />}
+                    開始解析
+                  </button>
+                </motion.div>
+              )}
+            </div>
+
+            <form name="activityForm" onSubmit={handleAddActivity} className="space-y-4">
               <div>
                 <label className="block text-sm font-medium text-zinc-700 mb-1">日期</label>
-                <select name="date" className="w-full p-3 bg-zinc-50 border border-zinc-200 rounded-xl">
+                <select name="date" defaultValue={activeTab || getDateRange()[0]} className="w-full p-3 bg-zinc-50 border border-zinc-200 rounded-xl">
                   {getDateRange().map(d => <option key={d} value={d}>{d}</option>)}
                 </select>
               </div>
@@ -1140,7 +1802,7 @@ export default function App() {
               </div>
               <div>
                 <label className="block text-sm font-medium text-zinc-700 mb-1">活動名稱</label>
-                <input name="activity" required className="w-full p-3 bg-zinc-50 border border-zinc-200 rounded-xl" placeholder="例如：淺草寺" />
+                <input name="activity" className="w-full p-3 bg-zinc-50 border border-zinc-200 rounded-xl" placeholder="例如：淺草寺 (若留空將嘗試從地圖連結自動填入)" />
               </div>
               <div>
                 <label className="block text-sm font-medium text-zinc-700 mb-1">Google Maps 連結 (選填)</label>
